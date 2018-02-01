@@ -2463,7 +2463,7 @@ done:
 	s->rx_frame = (100 * bits * HZ) / (baud / 10);
 #ifdef CONFIG_SERIAL_SH_SCI_DMA
 	s->rx_timeout = DIV_ROUND_UP(s->buf_len_rx * 2 * s->rx_frame, 1000);
-	dev_dbg(port->dev, "DMA Rx t-out %ums, tty t-out %u jiffies\n",
+	dev_dbg(port->dev, "DMA Rx t-out %ums, tty t-out %uus\n",
 		s->rx_timeout * 1000 / HZ, port->timeout);
 	if (s->rx_timeout < msecs_to_jiffies(20))
 		s->rx_timeout = msecs_to_jiffies(20);
