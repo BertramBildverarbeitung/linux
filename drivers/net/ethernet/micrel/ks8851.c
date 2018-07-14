@@ -1093,13 +1093,56 @@ static void ks8851_set_msglevel(struct net_device *dev, u32 to)
 	ks->msg_enable = to;
 }
 
+static void ks8851_get_mdix(struct ks8851_net *ks,
+			    struct ethtool_link_ksettings *cmd)
+{
+	u16 sr, cr;
+
+	mutex_lock(&ks->lock);
+	sr = ks8851_rdreg16(ks, KS_P1SR);
+	cr = ks8851_rdreg16(ks, KS_P1CR);
+	mutex_unlock(&ks->lock);
+
+	cmd->base.eth_tp_mdix = sr & P1SR_OP_MDI ? ETH_TP_MDI : ETH_TP_MDI_X;
+	cmd->base.eth_tp_mdix_ctrl = cr & P1CR_DISAUTOMDIX ?
+	  (cr & P1CR_FORCEMDI ? ETH_TP_MDI : ETH_TP_MDI_X) : ETH_TP_MDI_AUTO;
+}
+
+static void ks8851_set_mdix(struct ks8851_net *ks,
+			    const struct ethtool_link_ksettings *cmd)
+{
+	u16 cr;
+
+	if (cmd->base.eth_tp_mdix_ctrl == ETH_TP_MDI_INVALID)
+		return;
+
+	mutex_lock(&ks->lock);
+	cr = ks8851_rdreg16(ks, KS_P1CR);
+
+	switch (cmd->base.eth_tp_mdix_ctrl) {
+	case ETH_TP_MDI_AUTO:
+		cr &= ~P1CR_DISAUTOMDIX;
+		break;
+	case ETH_TP_MDI:
+		cr |= P1CR_DISAUTOMDIX | P1CR_FORCEMDI;
+		break;
+	case ETH_TP_MDI_X:
+		cr |= P1CR_DISAUTOMDIX;
+		cr &= ~P1CR_FORCEMDI;
+		break;
+	}
+
+	ks8851_wrreg16(ks, KS_P1CR, cr);
+	mutex_unlock(&ks->lock);
+}
+
 static int ks8851_get_link_ksettings(struct net_device *dev,
 				     struct ethtool_link_ksettings *cmd)
 {
 	struct ks8851_net *ks = netdev_priv(dev);
 
+	ks8851_get_mdix(ks, cmd);
 	mii_ethtool_get_link_ksettings(&ks->mii, cmd);
-
 	return 0;
 }
 
@@ -1107,6 +1150,8 @@ static int ks8851_set_link_ksettings(struct net_device *dev,
 				     const struct ethtool_link_ksettings *cmd)
 {
 	struct ks8851_net *ks = netdev_priv(dev);
+
+	ks8851_set_mdix(ks, cmd);
 	return mii_ethtool_set_link_ksettings(&ks->mii, cmd);
 }
 

@@ -273,12 +273,13 @@
 
 #define KS_P1SCLMD				0xF4
 
+/* Spec rev. 2.1 inverted the meaning of P1CR_FORCEMDI */
 #define KS_P1CR					0xF6
 #define P1CR_LEDOFF				(1 << 15)
 #define P1CR_TXIDS				(1 << 14)
 #define P1CR_RESTARTAN				(1 << 13)
 #define P1CR_DISAUTOMDIX			(1 << 10)
-#define P1CR_FORCEMDIX				(1 << 9)
+#define P1CR_FORCEMDI				(1 << 9)
 #define P1CR_AUTONEGEN				(1 << 7)
 #define P1CR_FORCE100				(1 << 6)
 #define P1CR_FORCEFDX				(1 << 5)
