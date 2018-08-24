@@ -72,6 +72,8 @@
 #define BCM2835_SPI_CS_CS_10		0x00000002
 #define BCM2835_SPI_CS_CS_01		0x00000001
 
+#define BCM2835_SPI_FIFO_SIZE		64
+#define BCM2835_SPI_FIFO_SIZE_3_4	48
 #define BCM2835_SPI_POLLING_LIMIT_US	30
 #define BCM2835_SPI_POLLING_JIFFIES	2
 #define BCM2835_SPI_DMA_MIN_LENGTH	96
@@ -167,6 +169,45 @@ static inline void bcm2835_wr_fifo_count(struct bcm2835_spi *bs, int count)
 	}
 }
 
+/**
+ * bcm2835_rd_fifo_blind() - blindly read up to @count bytes from RX FIFO
+ * @bs: BCM2835 SPI controller
+ * @count: bytes available for reading in RX FIFO
+ */
+static inline void bcm2835_rd_fifo_blind(struct bcm2835_spi *bs, int count)
+{
+	u8 val;
+
+	count = min(count, bs->rx_len);
+	bs->rx_len -= count;
+
+	while (count) {
+		val = bcm2835_rd(bs, BCM2835_SPI_FIFO);
+		if (bs->rx_buf)
+			*bs->rx_buf++ = val;
+		count--;
+	}
+}
+
+/**
+ * bcm2835_wr_fifo_blind() - blindly write up to @count bytes to TX FIFO
+ * @bs: BCM2835 SPI controller
+ * @count: bytes available for writing in TX FIFO
+ */
+static inline void bcm2835_wr_fifo_blind(struct bcm2835_spi *bs, int count)
+{
+	u8 val;
+
+	count = min(count, bs->tx_len);
+	bs->tx_len -= count;
+
+	while (count) {
+		val = bs->tx_buf ? *bs->tx_buf++ : 0;
+		bcm2835_wr(bs, BCM2835_SPI_FIFO, val);
+		count--;
+	}
+}
+
 static void bcm2835_spi_reset_hw(struct spi_master *master)
 {
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
@@ -190,6 +231,18 @@ static irqreturn_t bcm2835_spi_interrupt(int irq, void *dev_id)
 {
 	struct spi_master *master = dev_id;
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
+	u32 cs = bcm2835_rd(bs, BCM2835_SPI_CS);
+
+	/*
+	 * An interrupt is signaled either if RXR is set (RX FIFO >= 3/4 full)
+	 * or if DONE is set (TX FIFO empty, but RX FIFO may contain residue).
+	 * TX is halted once the RX FIFO is full, so drain the RX FIFO first.
+	 */
+	if (cs & BCM2835_SPI_CS_RXR) {
+		bcm2835_rd_fifo_blind(bs, BCM2835_SPI_FIFO_SIZE_3_4);
+	} else if (bs->tx_len && cs & BCM2835_SPI_CS_DONE) {
+		bcm2835_wr_fifo_blind(bs, BCM2835_SPI_FIFO_SIZE);
+	}
 
 	/* Read as many bytes as possible from FIFO */
 	bcm2835_rd_fifo(bs);
@@ -220,6 +273,7 @@ static int bcm2835_spi_transfer_one_irq(struct spi_master *master,
 	bcm2835_wr(bs, BCM2835_SPI_CS, cs | BCM2835_SPI_CS_TA);
 
 	/* fill TX FIFO as much as possible */
+	bcm2835_wr_fifo_blind(bs, BCM2835_SPI_FIFO_SIZE);
 	bcm2835_wr_fifo(bs);
 
 	/* enable interrupts */
@@ -576,13 +630,13 @@ static int bcm2835_spi_transfer_one_poll(struct spi_master *master,
 	unsigned long timeout;
 
 	/* enable HW block without interrupts */
-	bcm2835_wr(bs, BCM2835_SPI_CS, cs | BCM2835_SPI_CS_TA);
+	bcm2835_wr(bs, BCM2835_SPI_CS, cs |= BCM2835_SPI_CS_TA);
 
 	/* fill in the fifo before timeout calculations
 	 * if we are interrupted here, then the data is
 	 * getting transferred by the HW while we are interrupted
 	 */
-	bcm2835_wr_fifo(bs);
+	bcm2835_wr_fifo_blind(bs, BCM2835_SPI_FIFO_SIZE);
 
 	/* set the timeout */
 	timeout = jiffies + BCM2835_SPI_POLLING_JIFFIES;
@@ -604,8 +658,10 @@ static int bcm2835_spi_transfer_one_poll(struct spi_master *master,
 					    jiffies - timeout,
 					    bs->tx_len, bs->rx_len);
 			/* fall back to interrupt mode */
-			return bcm2835_spi_transfer_one_irq(master, spi,
-							    tfr, cs);
+			cs |= BCM2835_SPI_CS_INTR | BCM2835_SPI_CS_INTD;
+			bcm2835_wr(bs, BCM2835_SPI_CS, cs);
+			/* tell SPI core to wait for completion */
+			return 1;
 		}
 	}
 
