@@ -126,6 +126,47 @@ static inline void bcm2835_wr_fifo(struct bcm2835_spi *bs)
 	}
 }
 
+/**
+ * bcm2835_rd_fifo_count() - poll RX FIFO to read exactly @count bytes
+ * @bs: BCM2835 SPI controller
+ * @count: bytes to read from RX FIFO
+ */
+static inline void bcm2835_rd_fifo_count(struct bcm2835_spi *bs, int count)
+{
+	u8 byte;
+
+	bs->rx_len -= count;
+
+	while (count) {
+		if (!(bcm2835_rd(bs, BCM2835_SPI_CS) & BCM2835_SPI_CS_RXD)) {
+			cpu_relax();
+			continue;
+		}
+		byte = bcm2835_rd(bs, BCM2835_SPI_FIFO);
+		if (bs->rx_buf)
+			*bs->rx_buf++ = byte;
+		count--;
+	}
+}
+
+/**
+ * bcm2835_wr_fifo_count() - blindly write exactly @count bytes to TX FIFO
+ * @bs: BCM2835 SPI controller
+ * @count: bytes to write to TX FIFO
+ */
+static inline void bcm2835_wr_fifo_count(struct bcm2835_spi *bs, int count)
+{
+	u8 byte;
+
+	bs->tx_len -= count;
+
+	while (count) {
+		byte = bs->tx_buf ? *bs->tx_buf++ : 0;
+		bcm2835_wr(bs, BCM2835_SPI_FIFO, byte);
+		count--;
+	}
+}
+
 static void bcm2835_spi_reset_hw(struct spi_master *master)
 {
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
@@ -198,15 +239,111 @@ static int bcm2835_spi_transfer_one_irq(struct spi_master *master,
  * the main one being that DMA transfers are limited to 16 bit
  * (so 0 to 65535 bytes) by the SPI HW due to BCM2835_SPI_DLEN
  *
- * also we currently assume that the scatter-gather fragments are
- * all multiple of 4 (except the last) - otherwise we would need
- * to reset the FIFO before subsequent transfers...
- * this also means that tx/rx transfers sg's need to be of equal size!
- *
  * there may be a few more border-cases we may need to address as well
  * but unfortunately this would mean splitting up the scatter-gather
  * list making it slightly unpractical...
  */
+
+/**
+ * bcm2835_spi_transfer_prologue() - transfer first few bytes without DMA
+ * @master: BCM2835 SPI controller
+ * @tfr: SPI transfer
+ *
+ * A limitation in DMA mode is that the FIFO must be accessed in 4 byte chunks.
+ * Only the final write access is permitted to transmit less than 4 bytes, the
+ * SPI controller deduces its intended size from the DLEN register.
+ *
+ * If a TX or RX sglist contains multiple entries, one per page, and the first
+ * entry starts in the middle of a page, that first entry's length may not be
+ * a multiple of 4.  Subsequent entries are fine because they span an entire
+ * page, hence do have a length that's a multiple of 4.
+ *
+ * The DMA engine is incapable of combining sglist entries into a continuous
+ * stream of 4 byte chunks, it treats every entry separately:  A TX entry is
+ * rounded up a to a multiple of 4 bytes by transmitting surplus bytes, an RX
+ * entry is rounded up by throwing away received bytes.
+ *
+ * This cannot happen with kmalloc'ed buffers (which is what most clients use)
+ * because they are contiguous in physical memory and therefore not split on
+ * page boundaries.  But it *can* happen with vmalloc'ed buffers.
+ *
+ * Overcome this limitation by transferring the first few bytes without DMA:
+ * E.g. if the first TX sglist entry's length is 23 and the first RX's is 42,
+ * write 3 bytes to the TX FIFO but read only 2 bytes from the RX FIFO.
+ * The residue of 1 byte in the RX FIFO is picked up by DMA.  Together with
+ * the rest of the first RX sglist entry it makes up a multiple of 4 bytes.
+ *
+ * Should the RX prologue be larger, say, 3 vis-à-vis a TX prologue of 1,
+ * write 1 + 4 = 5 bytes to the TX FIFO and read 3 bytes from the RX FIFO.
+ * Caution, the additional 4 bytes spill over to the second TX sglist entry
+ * if the length of the first is *exactly* 1.
+ *
+ * At most 6 bytes are written and at most 3 bytes read.  Do we know the
+ * transfer has this many bytes?  Yes, see BCM2835_SPI_DMA_MIN_LENGTH.
+ *
+ * Return 0 on success or a negative errno otherwise.
+ */
+static int bcm2835_spi_transfer_prologue(struct spi_master *master,
+					 struct spi_transfer *tfr)
+{
+	struct bcm2835_spi *bs = spi_master_get_devdata(master);
+	int tx_prologue = 0, rx_prologue = 0;
+	bool tx_spillover = false;
+
+	if (!sg_is_last(&tfr->tx_sg.sgl[0]))
+		tx_prologue = sg_dma_len(&tfr->tx_sg.sgl[0]) & 3;
+
+	if (!sg_is_last(tfr->rx_sg.sgl)) {
+		rx_prologue = sg_dma_len(&tfr->rx_sg.sgl[0]) & 3;
+		if (rx_prologue > tx_prologue) {
+			tx_prologue += 4;
+			tx_spillover = !(sg_dma_len(&tfr->tx_sg.sgl[0]) & ~3);
+		}
+	}
+
+	/* rx_prologue > 0 implies tx_prologue > 0, so check only the latter */
+	if (!tx_prologue)
+		return 0;
+
+	/*
+	 * Write prologue to TX FIFO and adjust first entry in TX sglist.
+	 * Also adjust second entry if prologue spills over to it.
+	 */
+	dma_unmap_sg(master->dma_tx->device->dev, tfr->tx_sg.sgl,
+		     tx_spillover ? 2 : 1, DMA_TO_DEVICE);
+
+	bcm2835_wr_fifo_count(bs, tx_prologue);
+	if (likely(!tx_spillover)) {
+		tfr->tx_sg.sgl[0].offset += tx_prologue;
+		tfr->tx_sg.sgl[0].length -= tx_prologue;
+	} else {
+		tfr->tx_sg.sgl[0].length  = 0;
+		tfr->tx_sg.sgl[1].offset  = 4;
+		tfr->tx_sg.sgl[1].length -= 4;
+	}
+
+	if (!dma_map_sg(master->dma_tx->device->dev, tfr->tx_sg.sgl,
+			tx_spillover ? 2 : 1, DMA_TO_DEVICE))
+		return -ENOMEM;
+
+	if (!rx_prologue)
+		return 0;
+
+	/* read prologue from RX FIFO and adjust first entry in RX sglist */
+	dma_unmap_sg(master->dma_rx->device->dev, tfr->rx_sg.sgl,
+		     1, DMA_FROM_DEVICE);
+
+	bcm2835_rd_fifo_count(bs, rx_prologue);
+	tfr->rx_sg.sgl[0].offset += rx_prologue;
+	tfr->rx_sg.sgl[0].length -= rx_prologue;
+
+	if (!dma_map_sg(master->dma_rx->device->dev, tfr->rx_sg.sgl,
+			1, DMA_FROM_DEVICE))
+		return -ENOMEM;
+
+	return 0;
+}
+
 static void bcm2835_spi_dma_done(void *data)
 {
 	struct spi_master *master = data;
@@ -273,20 +410,6 @@ static int bcm2835_spi_prepare_sg(struct spi_master *master,
 	return dma_submit_error(cookie);
 }
 
-static inline int bcm2835_check_sg_length(struct sg_table *sgt)
-{
-	int i;
-	struct scatterlist *sgl;
-
-	/* check that the sg entries are word-sized (except for last) */
-	for_each_sg(sgt->sgl, sgl, (int)sgt->nents - 1, i) {
-		if (sg_dma_len(sgl) % 4)
-			return -EFAULT;
-	}
-
-	return 0;
-}
-
 static int bcm2835_spi_transfer_one_dma(struct spi_master *master,
 					struct spi_device *spi,
 					struct spi_transfer *tfr,
@@ -295,31 +418,31 @@ static int bcm2835_spi_transfer_one_dma(struct spi_master *master,
 	struct bcm2835_spi *bs = spi_master_get_devdata(master);
 	int ret;
 
-	/* check that the scatter gather segments are all a multiple of 4 */
-	if (bcm2835_check_sg_length(&tfr->tx_sg) ||
-	    bcm2835_check_sg_length(&tfr->rx_sg)) {
-		dev_warn_once(&spi->dev,
-			      "scatter gather segment length is not a multiple of 4 - falling back to interrupt mode\n");
-		return bcm2835_spi_transfer_one_irq(master, spi, tfr, cs);
-	}
+	/* start the HW */
+	bcm2835_wr(bs, BCM2835_SPI_CS, cs |= BCM2835_SPI_CS_TA);
+
+	/*
+	 * Transfer first few bytes without DMA if length of first TX or RX
+	 * sglist entry is not a multiple of 4 bytes (hardware limitation).
+	 */
+	ret = bcm2835_spi_transfer_prologue(master, tfr);
+	if (ret)
+		goto err_reset_hw;
+
+	/* enable DMA mode, set the DMA length */
+	bcm2835_wr(bs, BCM2835_SPI_CS, cs | BCM2835_SPI_CS_DMAEN);
+	bcm2835_wr(bs, BCM2835_SPI_DLEN, bs->tx_len);
 
 	/* setup tx-DMA */
 	ret = bcm2835_spi_prepare_sg(master, tfr, true);
 	if (ret)
-		return ret;
+		goto err_reset_hw;
 
 	/* start TX early */
 	dma_async_issue_pending(master->dma_tx);
 
 	/* mark as dma pending */
 	bs->dma_pending = 1;
-
-	/* set the DMA length */
-	bcm2835_wr(bs, BCM2835_SPI_DLEN, tfr->len);
-
-	/* start the HW */
-	bcm2835_wr(bs, BCM2835_SPI_CS,
-		   cs | BCM2835_SPI_CS_TA | BCM2835_SPI_CS_DMAEN);
 
 	/* setup rx-DMA late - to run transfers while
 	 * mapping of the rx buffers still takes place
@@ -329,8 +452,7 @@ static int bcm2835_spi_transfer_one_dma(struct spi_master *master,
 	if (ret) {
 		/* need to reset on errors */
 		dmaengine_terminate_all(master->dma_tx);
-		bcm2835_spi_reset_hw(master);
-		return ret;
+		goto err_reset_hw;
 	}
 
 	/* start rx dma late */
@@ -338,6 +460,10 @@ static int bcm2835_spi_transfer_one_dma(struct spi_master *master,
 
 	/* wait for wakeup in framework */
 	return 1;
+
+err_reset_hw:
+	bcm2835_spi_reset_hw(master);
+	return ret;
 }
 
 static bool bcm2835_spi_can_dma(struct spi_master *master,
@@ -358,25 +484,6 @@ static bool bcm2835_spi_can_dma(struct spi_master *master,
 		dev_warn_once(&spi->dev,
 			      "transfer size of %d too big for dma-transfer\n",
 			      tfr->len);
-		return false;
-	}
-
-	/* if we run rx/tx_buf with word aligned addresses then we are OK */
-	if ((((size_t)tfr->rx_buf & 3) == 0) &&
-	    (((size_t)tfr->tx_buf & 3) == 0))
-		return true;
-
-	/* otherwise we only allow transfers within the same page
-	 * to avoid wasting time on dma_mapping when it is not practical
-	 */
-	if (((size_t)tfr->tx_buf & (PAGE_SIZE - 1)) + tfr->len > PAGE_SIZE) {
-		dev_warn_once(&spi->dev,
-			      "Unaligned spi tx-transfer bridging page\n");
-		return false;
-	}
-	if (((size_t)tfr->rx_buf & (PAGE_SIZE - 1)) + tfr->len > PAGE_SIZE) {
-		dev_warn_once(&spi->dev,
-			      "Unaligned spi rx-transfer bridging page\n");
 		return false;
 	}
 
